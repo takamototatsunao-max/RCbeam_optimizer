@@ -252,11 +252,19 @@ def read_input(path):
     return mat, setts, cost, beams, cands, warnings
 
 
-def env(span, w, p, r, n):
-    L = span
+def support_reactions(span, w, p, r):
+    L = max(0.0, float(span))
     a = (0.5 if p == 0 else clamp(r, 0.0, 1.0)) * L
+    if L <= 0.0:
+        return a, 0.0, 0.0
     R1 = w * L * 0.5 + p * (L - a) / L
     R2 = w * L * 0.5 + p * a / L
+    return a, R1, R2
+
+
+def env(span, w, p, r, n):
+    L = span
+    a, R1, R2 = support_reactions(span, w, p, r)
     Mx, Vx, xM, xV = 0.0, max(abs(R1), abs(R2)), 0.0, (0.0 if abs(R1) >= abs(R2) else L)
     n = max(40, n)
     for i in range(n + 1):
@@ -299,6 +307,48 @@ def defl_mm(span, w, p, r, ei, n):
             ym, xm = abs(yy), xs[i] / 1000.0
     return ym, xm
 
+
+def response_arrays(span, w_u, p_u, w_s, p_s, r, ei, n=20):
+    if span <= 0:
+        return [], [], [], []
+
+    n = max(4, int(n))
+    x_u = [span * i / n for i in range(n + 1)]
+    a_u, R1_u, _R2_u = support_reactions(span, w_u, p_u, r)
+    V_u, M_u = [], []
+    for x in x_u:
+        M_u.append(R1_u * x - 0.5 * w_u * x * x - p_u * max(0.0, x - a_u))
+        V_u.append(R1_u - w_u * x - (p_u if x >= a_u else 0.0))
+
+    if ei <= 0:
+        return x_u, V_u, M_u, [None] * len(x_u)
+
+    L = span * 1000.0
+    x_s = [L * i / n for i in range(n + 1)]
+    a_s = (0.5 if p_s == 0 else clamp(r, 0.0, 1.0)) * L
+    wN = w_s
+    PN = p_s * 1000.0
+    R1_s = wN * L * 0.5 + PN * (L - a_s) / L
+
+    curv = []
+    for x in x_s:
+        M = R1_s * x - 0.5 * wN * x * x - PN * max(0.0, x - a_s)
+        curv.append(M / ei)
+
+    i1 = [0.0]
+    for i in range(1, len(x_s)):
+        dx = x_s[i] - x_s[i - 1]
+        i1.append(i1[-1] + 0.5 * (curv[i - 1] + curv[i]) * dx)
+
+    i2 = [0.0]
+    for i in range(1, len(x_s)):
+        dx = x_s[i] - x_s[i - 1]
+        i2.append(i2[-1] + 0.5 * (i1[i - 1] + i1[i]) * dx)
+
+    c1 = -i2[-1] / L
+    y_mm = [i2[i] + c1 * x_s[i] for i in range(len(x_s))]
+    return x_u, V_u, M_u, y_mm
+
 def eval_cand(beam, cand, mat, setts, cost, n_override=0):
     b, h = cand["b"], cand["h"]
     db, Ab, wb = bar(cand["db"])
@@ -312,10 +362,6 @@ def eval_cand(beam, cand, mat, setts, cost, n_override=0):
     else:
         dt, wt = 0.0, 0.0
 
-    d = h - mat["cover"] - ds - 0.5 * db
-    if d <= 0:
-        return {"beam": beam["id"], "rank": cand["rank"], "sec": cand["sec"], "ok": False, "ng": "d<=0", "util": float("inf"), "obj": float("inf")}
-
     n = n_override if n_override > 0 else mat["n_div"]
     sw = mat["gamma"] * (b / 1000.0) * (h / 1000.0)
     wD = beam["qD"] * beam["trib"] + sw
@@ -324,37 +370,19 @@ def eval_cand(beam, cand, mat, setts, cost, n_override=0):
     wU = setts["gD"] * wD + setts["gL"] * wL
     pU = setts["gD"] * beam["PD"] + setts["gL"] * beam["PL"]
 
-    Mu, _xmu, Vu, _xvu = env(beam["span"], wU, pU, beam["r"], n)
-    Ms, _xms, _vs, _xvs = env(beam["span"], wS, pS, beam["r"], n)
+    Mu, xmu, Vu, xvu = env(beam["span"], wU, pU, beam["r"], n)
+    Ms, xms, _vs, _xvs = env(beam["span"], wS, pS, beam["r"], n)
+    a_p, R1s, R2s = support_reactions(beam["span"], wS, pS, beam["r"])
+    _a_u, R1u, R2u = support_reactions(beam["span"], wU, pU, beam["r"])
 
     As = cand["nb"] * Ab
     Asv = cand["legs"] * As1
-    a = As * mat["fy"] / (0.85 * mat["fc"] * b)
-    if a >= d:
-        phiMn = 0.0
-        okM = False
-        uM = float("inf")
-    else:
-        Mn = As * mat["fy"] * (d - 0.5 * a) / 1e6
-        phiMn = mat["phi_m"] * Mn
-        okM = phiMn >= Mu
-        uM = Mu / phiMn if phiMn > 0 else float("inf")
-
-    # ACI-style simplified shear:
-    # - With stirrups: Vc ~= 0.17*sqrt(fc)*bw*d (SI)
-    # - Without stirrups: use reduced concrete term 0.083*sqrt(fc)*bw*d (SI)
-    vc_coef = 0.17 if Asv > 0.0 else 0.083
-    Vc = vc_coef * math.sqrt(max(mat["fc"], 0.0)) * b * d / 1000.0
-    Vs = Asv * mat["fyv"] * d / max(1.0, cand["s"]) / 1000.0 if Asv > 0.0 else 0.0
-    phiVn = mat["phi_v"] * (Vc + Vs)
-    okV = phiVn >= Vu
-    uV = Vu / phiVn if phiVn > 0 else float("inf")
-
-    rho = As / (b * d)
-    rho_min = max(1.4 / max(mat["fy"], 1.0), 0.25 * math.sqrt(max(mat["fc"], 0.0)) / max(mat["fy"], 1.0))
-    rho_max = mat["rho_max"]
-    okR = rho >= rho_min and rho <= rho_max
-    uR = max(rho_min / rho if rho > 0 else float("inf"), rho / rho_max if rho_max > 0 else float("inf"))
+    Ec = 4700.0 * math.sqrt(max(mat["fc"], 0.0))
+    Ig = b * h ** 3 / 12.0
+    ei = Ec * mat["ei_fac"] * Ig
+    d = h - mat["cover"] - ds - 0.5 * db
+    dallow = beam["span"] * 1000.0 / max(mat["defl_ratio"], 1.0)
+    dmm, xd = defl_mm(beam["span"], wS, pS, beam["r"], ei, n)
 
     req_clear = max(mat["s_clear_min"], db)
     if cand["nb"] <= 1:
@@ -363,29 +391,66 @@ def eval_cand(beam, cand, mat, setts, cost, n_override=0):
         net = b - 2.0 * (mat["cover"] + ds)
         clear = (net - cand["nb"] * db) / (cand["nb"] - 1)
         okC = clear >= req_clear
-        uC = req_clear / clear if clear > 0 else float("inf")
+        uC = req_clear / clear if clear and clear > 0 else float("inf")
 
-    if Asv > 0.0:
-        s_lim = min(300.0, 0.75 * d)
-        okS = cand["s"] <= s_lim
-        uS = cand["s"] / s_lim if s_lim > 0 else float("inf")
-    else:
+    if d <= 0:
+        Mn = phiMn = Vc = Vs = phiVn = 0.0
+        okM = okV = okD = okFs = okR = False
+        okS = not has_stirrups
+        uM = uV = uD = uFs = uR = float("inf")
         s_lim = 0.0
-        okS = True
-        uS = 0.0
+        uS = 0.0 if okS else float("inf")
+        rho = float("inf")
+        rho_min = max(1.4 / max(mat["fy"], 1.0), 0.25 * math.sqrt(max(mat["fc"], 0.0)) / max(mat["fy"], 1.0))
+        rho_max = mat["rho_max"]
+        fs = float("inf")
+        z = 0.0
+        a_blk = None
+    else:
+        a_blk = As * mat["fy"] / (0.85 * mat["fc"] * b)
+        if a_blk >= d:
+            Mn = 0.0
+            phiMn = 0.0
+            okM = False
+            uM = float("inf")
+        else:
+            Mn = As * mat["fy"] * (d - 0.5 * a_blk) / 1e6
+            phiMn = mat["phi_m"] * Mn
+            okM = phiMn >= Mu
+            uM = Mu / phiMn if phiMn > 0 else float("inf")
 
-    z = 0.9 * d
-    fs = Ms * 1e6 / (As * z) if As > 0 and z > 0 else float("inf")
-    okFs = fs <= mat["fs_lim"]
-    uFs = fs / mat["fs_lim"] if mat["fs_lim"] > 0 else float("inf")
+        # ACI-style simplified shear:
+        # - With stirrups: Vc ~= 0.17*sqrt(fc)*bw*d (SI)
+        # - Without stirrups: use reduced concrete term 0.083*sqrt(fc)*bw*d (SI)
+        vc_coef = 0.17 if Asv > 0.0 else 0.083
+        Vc = vc_coef * math.sqrt(max(mat["fc"], 0.0)) * b * d / 1000.0
+        Vs = Asv * mat["fyv"] * d / max(1.0, cand["s"]) / 1000.0 if Asv > 0.0 else 0.0
+        phiVn = mat["phi_v"] * (Vc + Vs)
+        okV = phiVn >= Vu
+        uV = Vu / phiVn if phiVn > 0 else float("inf")
 
-    Ec = 4700.0 * math.sqrt(max(mat["fc"], 0.0))
-    Ig = b * h ** 3 / 12.0
-    ei = Ec * mat["ei_fac"] * Ig
-    dmm, _xd = defl_mm(beam["span"], wS, pS, beam["r"], ei, n)
-    dallow = beam["span"] * 1000.0 / max(mat["defl_ratio"], 1.0)
-    okD = dmm <= dallow
-    uD = dmm / dallow if dallow > 0 else float("inf")
+        rho = As / (b * d)
+        rho_min = max(1.4 / max(mat["fy"], 1.0), 0.25 * math.sqrt(max(mat["fc"], 0.0)) / max(mat["fy"], 1.0))
+        rho_max = mat["rho_max"]
+        okR = rho >= rho_min and rho <= rho_max
+        uR = max(rho_min / rho if rho > 0 else float("inf"), rho / rho_max if rho_max > 0 else float("inf"))
+
+        if Asv > 0.0:
+            s_lim = min(300.0, 0.75 * d)
+            okS = cand["s"] <= s_lim
+            uS = cand["s"] / s_lim if s_lim > 0 else float("inf")
+        else:
+            s_lim = 0.0
+            okS = True
+            uS = 0.0
+
+        z = 0.9 * d
+        fs = Ms * 1e6 / (As * z) if As > 0 and z > 0 else float("inf")
+        okFs = fs <= mat["fs_lim"]
+        uFs = fs / mat["fs_lim"] if mat["fs_lim"] > 0 else float("inf")
+
+        okD = dmm <= dallow
+        uD = dmm / dallow if dallow > 0 else float("inf")
 
     conc = (b / 1000.0) * (h / 1000.0) * beam["span"]
     form = (2.0 * h / 1000.0 + b / 1000.0) * beam["span"]
@@ -427,6 +492,8 @@ def eval_cand(beam, cand, mat, setts, cost, n_override=0):
         ng.append("clear_spacing")
     if not okS:
         ng.append("stirrup_spacing")
+    if d <= 0:
+        ng.insert(0, "d<=0")
 
     return {
         "beam": beam["id"], "rank": cand["rank"], "sec": cand["sec"], "b": b, "h": h,
@@ -437,6 +504,15 @@ def eval_cand(beam, cand, mat, setts, cost, n_override=0):
         "conc": conc, "steel": steel, "form": form, "cost": cost_jpy, "co2": co2, "obj": obj,
         "okM": okM, "okV": okV, "okD": okD, "okFs": okFs, "okR": okR, "okC": okC, "okS": okS,
         "ok": ok, "ng": ", ".join(ng), "util": max(uM, uV, uD, uFs, uR, uC, uS),
+        "span": beam["span"], "trib": beam["trib"], "qD_area": beam["qD"], "qL_area": beam["qL"],
+        "PD": beam["PD"], "PL": beam["PL"], "r": beam["r"], "point_a": a_p,
+        "nb": cand["nb"], "db": cand["db"], "nt": cand["nt"], "dt": cand["dt"],
+        "legs": cand["legs"], "ds": cand["ds"], "cover": mat["cover"],
+        "Ab": Ab, "As": As, "Asv": Asv, "d_eff": d, "a_blk": a_blk, "Mn": Mn,
+        "Vc": Vc, "Vs": Vs, "Ec": Ec, "Ig": Ig, "ei": ei, "z": z,
+        "sw": sw, "wD": wD, "wL": wL, "wS": wS, "wU": wU, "pS": pS, "pU": pU,
+        "R1s": R1s, "R2s": R2s, "R1u": R1u, "R2u": R2u,
+        "xMu": xmu, "Ms": Ms, "xMs": xms, "xVu": xvu, "xd": xd,
     }
 
 
@@ -456,10 +532,10 @@ def optimize(mat, setts, cost, beams, cands, n_override=0):
     return checks, best, status
 
 
-def style_header(ws):
+def style_header(ws, row=1):
     fill = PatternFill("solid", fgColor="1F4E78")
     font = Font(color="FFFFFF", bold=True)
-    for c in ws[1]:
+    for c in ws[row]:
         c.fill = fill
         c.font = font
         c.alignment = Alignment(horizontal="center", vertical="center")
@@ -474,20 +550,149 @@ def autosize(ws, maxw=42):
         ws.column_dimensions[col[0].column_letter].width = w
 
 
+def nround(v, digits=3):
+    if v is None:
+        return None
+    try:
+        fv = float(v)
+    except Exception:
+        return v
+    if not math.isfinite(fv):
+        return None
+    return round(fv, digits)
+
+
+def write_calc_best_beams_sheet(wb, mat, setts, beams, best, status):
+    ws = wb.create_sheet("CALC_BEST_BEAMS")
+    ws.cell(row=1, column=1, value="CALC_BEST_BEAMS (Selected RC beam calculation sheet)").font = Font(bold=True, size=14)
+
+    selected = [best[b["id"]] for b in beams]
+    ok_count = sum(1 for b in beams if status[b["id"]] == "OK")
+    ng_count = len(beams) - ok_count
+    tconc = sum(r["conc"] for r in selected)
+    tsteel = sum(r["steel"] for r in selected)
+    tform = sum(r["form"] for r in selected)
+    tcost = sum(r["cost"] for r in selected)
+    tco2 = sum(r["co2"] for r in selected)
+    worst = max(selected, key=lambda r: (float("inf") if not math.isfinite(r["util"]) else r["util"], r["Mu"], r["Vu"], r["dmm"]))
+
+    summary_headers = [
+        "BeamCount", "OKCount", "NGCount", "ObjectiveMode", "CostWeight", "CO2Weight",
+        "WorstBeamID", "WorstUtil", "TotalCost[JPY]", "TotalCO2[kg]", "Concrete[m3]", "Rebar[kg]", "Formwork[m2]",
+    ]
+    summary_vals = [
+        len(beams), ok_count, ng_count, setts["mode"], setts["w_cost"], setts["w_co2"],
+        worst["beam"], nround(worst["util"], 4), nround(tcost, 2), nround(tco2, 3),
+        nround(tconc, 4), nround(tsteel, 3), nround(tform, 3),
+    ]
+    for c, v in enumerate(summary_headers, start=1):
+        ws.cell(row=3, column=c, value=v)
+    for c, v in enumerate(summary_vals, start=1):
+        ws.cell(row=4, column=c, value=v)
+    style_header(ws, 3)
+
+    ws.cell(row=6, column=1, value="Strength checks use ULS line loads (wU, pU); deflection uses service loads (wS, pS).").font = Font(italic=True)
+    ws.cell(row=7, column=1, value="Array tables below show ULS shear/moment and service deflection on the same 20-division x grid.").font = Font(italic=True)
+
+    ws.cell(row=9, column=1, value="Selected beam summary (one governing candidate per beam)").font = Font(bold=True)
+    headers = [
+        "No", "BeamID", "Status", "Rank", "Section", "Span[m]", "Trib[m]",
+        "qD[kN/m2]", "qL[kN/m2]", "PD[kN]", "PL[kN]", "PointPosRatio", "Point_a[m]",
+        "b[mm]", "h[mm]", "Bottom", "Top", "Stirrup",
+        "d[mm]", "As[mm2]", "Asv[mm2]", "a_blk[mm]", "Mn[kN*m]", "phiMn[kN*m]",
+        "Vc[kN]", "Vs[kN]", "phiVn[kN]", "sw[kN/m]",
+        "wD[kN/m]", "wL[kN/m]", "wS[kN/m]", "pS[kN]", "wU[kN/m]", "pU[kN]",
+        "R1s[kN]", "R2s[kN]", "R1u[kN]", "R2u[kN]",
+        "Mu[kN*m]", "xMu[m]", "Vu[kN]", "xVu[m]",
+        "Defl[mm]", "xDefl[m]", "DeflAllow[mm]", "SteelStress[N/mm2]",
+        "rho", "Clear[mm]", "Cost[JPY]", "CO2[kg]", "UtilMax", "NG_Reason",
+    ]
+    for c, v in enumerate(headers, start=1):
+        ws.cell(row=10, column=c, value=v)
+    style_header(ws, 10)
+
+    row = 11
+    for i, beam in enumerate(beams, start=1):
+        r = best[beam["id"]]
+        ws.append([
+            i, beam["id"], status[beam["id"]], r["rank"], r["sec"], nround(r["span"], 3), nround(r["trib"], 3),
+            nround(r["qD_area"], 3), nround(r["qL_area"], 3), nround(r["PD"], 3), nround(r["PL"], 3), nround(r["r"], 4), nround(r["point_a"], 3),
+            nround(r["b"], 1), nround(r["h"], 1), r["bot"], r["top"], r["st"],
+            nround(r["d_eff"], 3), nround(r["As"], 3), nround(r["Asv"], 3), nround(r["a_blk"], 3), nround(r["Mn"], 3), nround(r["phiMn"], 3),
+            nround(r["Vc"], 3), nround(r["Vs"], 3), nround(r["phiVn"], 3), nround(r["sw"], 3),
+            nround(r["wD"], 3), nround(r["wL"], 3), nround(r["wS"], 3), nround(r["pS"], 3), nround(r["wU"], 3), nround(r["pU"], 3),
+            nround(r["R1s"], 3), nround(r["R2s"], 3), nround(r["R1u"], 3), nround(r["R2u"], 3),
+            nround(r["Mu"], 3), nround(r["xMu"], 3), nround(r["Vu"], 3), nround(r["xVu"], 3),
+            nround(r["dmm"], 3), nround(r["xd"], 3), nround(r["dallow"], 3), nround(r["fs"], 3),
+            nround(r["rho"], 6), nround(r["clear"], 3), nround(r["cost"], 2), nround(r["co2"], 3), nround(r["util"], 4), r["ng"],
+        ])
+        row += 1
+
+    row += 1
+    ws.cell(row=row, column=1, value=f"Worst selected beam arrays (BeamID={worst['beam']}, Section={worst['sec']}, Util={nround(worst['util'], 4)})").font = Font(bold=True)
+    row += 1
+    for c, v in enumerate(["x[m]", "V_u[kN]", "M_u[kN*m]", "y_service[mm]"], start=1):
+        ws.cell(row=row, column=c, value=v)
+    style_header(ws, row)
+    row += 1
+
+    xs, vs, ms, ys = response_arrays(worst["span"], worst["wU"], worst["pU"], worst["wS"], worst["pS"], worst["r"], worst["ei"], n=20)
+    for i in range(len(xs)):
+        ws.append([nround(xs[i], 4), nround(vs[i], 4), nround(ms[i], 4), nround(ys[i], 4)])
+
+    ws.freeze_panes = "A11"
+
+
+def write_calc_best_beam_arrays_sheet(wb, beams, best, status):
+    ws = wb.create_sheet("CALC_BEST_BEAM_ARRAYS")
+    ws.cell(row=1, column=1, value="CALC_BEST_BEAM_ARRAYS (selected beam x-V-M-deflection arrays)").font = Font(bold=True, size=14)
+    ws.cell(row=2, column=1, value="Each beam is output at fixed 20 divisions. V/M use ULS loads, deflection uses service loads.").font = Font(italic=True)
+
+    row = 4
+    for beam in beams:
+        r = best[beam["id"]]
+        ws.cell(
+            row=row,
+            column=1,
+            value=(
+                f"BeamID={beam['id']}, Status={status[beam['id']]}, Span={nround(r['span'], 3)}m, "
+                f"Section={r['sec']}(R{r['rank']}), Bottom={r['bot']}, Top={r['top']}, Stirrup={r['st']}"
+            ),
+        ).font = Font(bold=True)
+        row += 1
+        for c, v in enumerate(["x[m]", "V_u[kN]", "M_u[kN*m]", "y_service[mm]"], start=1):
+            ws.cell(row=row, column=c, value=v)
+        style_header(ws, row)
+        row += 1
+
+        xs, vs, ms, ys = response_arrays(r["span"], r["wU"], r["pU"], r["wS"], r["pS"], r["r"], r["ei"], n=20)
+        for i in range(len(xs)):
+            ws.append([nround(xs[i], 4), nround(vs[i], 4), nround(ms[i], 4), nround(ys[i], 4)])
+            row += 1
+        row += 1
+
+
 def write_out(out_path, mat, setts, beams, checks, best, status, warnings):
     wb = Workbook()
     wb.remove(wb.active)
     ws1 = wb.create_sheet("SUMMARY")
     ws2 = wb.create_sheet("CHECKS")
-    ws3 = wb.create_sheet("QUANTITY")
-    ws4 = wb.create_sheet("WARNINGS")
 
     ws1.append(["BeamID", "Status", "Rank", "Section", "b_mm", "h_mm", "Bottom", "Top", "Stirrup", "Objective", "Cost_JPY", "CO2_kg", "Mu_kNm", "phiMn_kNm", "Vu_kN", "phiVn_kN", "Defl_mm", "DeflAllow_mm", "SteelStress_N/mm2", "UtilMax", "NG_Reason"])
     tconc = tsteel = tform = tcost = tco2 = 0.0
     for b in beams:
         r = best[b["id"]]
-        ws1.append([b["id"], status[b["id"]], r["rank"], r["sec"], round(r["b"], 1), round(r["h"], 1), r["bot"], r["top"], r["st"], round(r["obj"], 2), round(r["cost"], 2), round(r["co2"], 3), round(r["Mu"], 3), round(r["phiMn"], 3), round(r["Vu"], 3), round(r["phiVn"], 3), round(r["dmm"], 3), round(r["dallow"], 3), round(r["fs"], 3), round(r["util"], 4), r["ng"]])
-        tconc += r["conc"]; tsteel += r["steel"]; tform += r["form"]; tcost += r["cost"]; tco2 += r["co2"]
+        ws1.append([
+            b["id"], status[b["id"]], r["rank"], r["sec"], nround(r["b"], 1), nround(r["h"], 1), r["bot"], r["top"], r["st"],
+            nround(r["obj"], 2), nround(r["cost"], 2), nround(r["co2"], 3), nround(r["Mu"], 3), nround(r["phiMn"], 3),
+            nround(r["Vu"], 3), nround(r["phiVn"], 3), nround(r["dmm"], 3), nround(r["dallow"], 3), nround(r["fs"], 3),
+            nround(r["util"], 4), r["ng"],
+        ])
+        tconc += r["conc"]
+        tsteel += r["steel"]
+        tform += r["form"]
+        tcost += r["cost"]
+        tco2 += r["co2"]
     style_header(ws1); ws1.freeze_panes = "A2"
 
     ws2.append(["BeamID", "Rank", "Section", "b_mm", "h_mm", "Bottom", "Top", "Stirrup", "Mu_kNm", "phiMn_kNm", "Vu_kN", "phiVn_kN", "Defl_mm", "DeflAllow_mm", "SteelStress_N/mm2", "rho", "rho_min", "rho_max", "Clear_mm", "ClearReq_mm", "s_mm", "sLim_mm", "Cost_JPY", "CO2_kg", "Objective", "Flex", "Shear", "Defl", "Stress", "Rho", "Clear", "Stirrup", "Pass", "UtilMax", "NG_Reason"])
@@ -498,32 +703,48 @@ def write_out(out_path, mat, setts, beams, checks, best, status, warnings):
     if len(rows) > setts["max_rows"]:
         rows = rows[:setts["max_rows"]]
     for r in rows:
-        ws2.append([r["beam"], r["rank"], r["sec"], round(r["b"], 1), round(r["h"], 1), r["bot"], r["top"], r["st"], round(r["Mu"], 3), round(r["phiMn"], 3), round(r["Vu"], 3), round(r["phiVn"], 3), round(r["dmm"], 3), round(r["dallow"], 3), round(r["fs"], 3), round(r["rho"], 6), round(r["rho_min"], 6), round(r["rho_max"], 6), (None if r["clear"] is None else round(r["clear"], 3)), round(r["clear_req"], 3), round(r["s"], 3), round(r["s_lim"], 3), round(r["cost"], 2), round(r["co2"], 3), round(r["obj"], 3), "OK" if r["okM"] else "NG", "OK" if r["okV"] else "NG", "OK" if r["okD"] else "NG", "OK" if r["okFs"] else "NG", "OK" if r["okR"] else "NG", "OK" if r["okC"] else "NG", "OK" if r["okS"] else "NG", "OK" if r["ok"] else "NG", round(r["util"], 4), r["ng"]])
+        ws2.append([
+            r["beam"], r["rank"], r["sec"], nround(r["b"], 1), nround(r["h"], 1), r["bot"], r["top"], r["st"],
+            nround(r["Mu"], 3), nround(r["phiMn"], 3), nround(r["Vu"], 3), nround(r["phiVn"], 3),
+            nround(r["dmm"], 3), nround(r["dallow"], 3), nround(r["fs"], 3), nround(r["rho"], 6),
+            nround(r["rho_min"], 6), nround(r["rho_max"], 6), nround(r["clear"], 3), nround(r["clear_req"], 3),
+            nround(r["s"], 3), nround(r["s_lim"], 3), nround(r["cost"], 2), nround(r["co2"], 3), nround(r["obj"], 3),
+            "OK" if r["okM"] else "NG", "OK" if r["okV"] else "NG", "OK" if r["okD"] else "NG",
+            "OK" if r["okFs"] else "NG", "OK" if r["okR"] else "NG", "OK" if r["okC"] else "NG",
+            "OK" if r["okS"] else "NG", "OK" if r["ok"] else "NG", nround(r["util"], 4), r["ng"],
+        ])
     style_header(ws2); ws2.freeze_panes = "A2"
 
-    ws3.append(["Item", "Total", "Unit"])
-    ws3.append(["Concrete", round(tconc, 4), "m3"])
-    ws3.append(["Rebar", round(tsteel, 3), "kg"])
-    ws3.append(["Formwork", round(tform, 3), "m2"])
-    ws3.append(["Total Cost", round(tcost, 2), "JPY"])
-    ws3.append(["Total CO2", round(tco2, 3), "kg-CO2e"])
-    ws3.append(["Objective Mode", setts["mode"], "-"])
-    ws3.append(["Cost Weight", setts["w_cost"], "-"])
-    ws3.append(["CO2 Weight", setts["w_co2"], "-"])
-    ws3.append(["fc", mat["fc"], "N/mm2"])
-    ws3.append(["fy", mat["fy"], "N/mm2"])
-    style_header(ws3)
+    write_calc_best_beams_sheet(wb, mat, setts, beams, best, status)
+    write_calc_best_beam_arrays_sheet(wb, beams, best, status)
+    ws3 = wb["CALC_BEST_BEAMS"]
+    ws4 = wb["CALC_BEST_BEAM_ARRAYS"]
 
-    ws4.append(["Type", "Message"])
+    ws5 = wb.create_sheet("QUANTITY")
+    ws5.append(["Item", "Total", "Unit"])
+    ws5.append(["Concrete", round(tconc, 4), "m3"])
+    ws5.append(["Rebar", round(tsteel, 3), "kg"])
+    ws5.append(["Formwork", round(tform, 3), "m2"])
+    ws5.append(["Total Cost", round(tcost, 2), "JPY"])
+    ws5.append(["Total CO2", round(tco2, 3), "kg-CO2e"])
+    ws5.append(["Objective Mode", setts["mode"], "-"])
+    ws5.append(["Cost Weight", setts["w_cost"], "-"])
+    ws5.append(["CO2 Weight", setts["w_co2"], "-"])
+    ws5.append(["fc", mat["fc"], "N/mm2"])
+    ws5.append(["fy", mat["fy"], "N/mm2"])
+    style_header(ws5)
+
+    ws6 = wb.create_sheet("WARNINGS")
+    ws6.append(["Type", "Message"])
     for m in warnings:
-        ws4.append(["INPUT_WARNING", m])
+        ws6.append(["INPUT_WARNING", m])
     for b in beams:
         if status[b["id"]] != "OK":
             r = best[b["id"]]
-            ws4.append(["DESIGN_WARNING", f"{b['id']}: no feasible candidate. closest={r['sec']}(rank={r['rank']}) NG={r['ng']}"])
-    style_header(ws4)
+            ws6.append(["DESIGN_WARNING", f"{b['id']}: no feasible candidate. closest={r['sec']}(rank={r['rank']}) NG={r['ng']}"])
+    style_header(ws6)
 
-    for ws in [ws1, ws2, ws3, ws4]:
+    for ws in [ws1, ws2, ws3, ws4, ws5, ws6]:
         autosize(ws)
     wb.save(out_path)
 
